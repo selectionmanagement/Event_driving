@@ -480,6 +480,31 @@ def parse_optional_number(value: str) -> Optional[float]:
         return None
 
 
+def rerun_app() -> None:
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+
+@st.dialog("Event keyword filter")
+def show_keyword_filter_dialog() -> None:
+    if "keyword_filter_input" not in st.session_state:
+        st.session_state["keyword_filter_input"] = st.session_state.get(
+            "keyword_filter", ""
+        )
+    st.write("Filter events by keywords. Use commas or new lines to separate terms.")
+    st.text_area("Keywords", key="keyword_filter_input", height=120)
+    col_apply, col_clear = st.columns(2)
+    if col_apply.button("Apply"):
+        st.session_state["keyword_filter"] = st.session_state["keyword_filter_input"].strip()
+        rerun_app()
+    if col_clear.button("Clear"):
+        st.session_state["keyword_filter"] = ""
+        st.session_state["keyword_filter_input"] = ""
+        rerun_app()
+
+
 def parse_keyword_filter(value: str) -> List[str]:
     return [token.strip() for token in re.split(r"[,\n]+", value) if token.strip()]
 
@@ -560,16 +585,18 @@ def main() -> None:
         st.session_state["price_df"] = pd.DataFrame()
     if "manual_events" not in st.session_state:
         st.session_state["manual_events"] = pd.DataFrame(columns=EVENT_COLUMNS)
+    if "keyword_filter" not in st.session_state:
+        st.session_state["keyword_filter"] = ""
 
     with st.sidebar:
         st.header("Event Data")
         events_csv_path = st.text_input("Event CSV path", value=SIMPLE_EVENTS_CSV_PATH)
         st.caption("Columns: A-Z (A=date dd/mm/yyyy, B=note, C=price; others optional)")
-        keyword_filter = st.text_input(
-            "Event keyword filter",
-            value="",
-            help="Comma/newline separated keywords (case-insensitive).",
-        )
+        if st.button("Open keyword filter"):
+            show_keyword_filter_dialog()
+        active_keywords = parse_keyword_filter(st.session_state["keyword_filter"])
+        if active_keywords:
+            st.caption(f"Active filter: {', '.join(active_keywords)}")
 
     simple_mode = True
     events_df = read_simple_events_csv(events_csv_path)
@@ -579,7 +606,7 @@ def main() -> None:
     events_df["scope"] = "market"
     events_df["source_url"] = ""
     events_df = ensure_columns(events_df, EVENT_COLUMNS + ["note", "event_price"] + COLUMN_LETTERS)
-    keyword_terms = parse_keyword_filter(keyword_filter)
+    keyword_terms = parse_keyword_filter(st.session_state["keyword_filter"])
     if keyword_terms:
         events_df = filter_events_by_keywords(events_df, keyword_terms, ["note", "title"])
 
@@ -594,7 +621,19 @@ def main() -> None:
             options=["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"],
             index=0,
         )
-        market_type = "Spot"
+        market_type = st.selectbox("Market type", options=["Spot", "Futures"], index=0)
+        spot_endpoints = {
+            "Binance API (api.binance.com)": "https://api.binance.com",
+            "Binance Vision (data-api.binance.vision)": "https://data-api.binance.vision",
+        }
+        spot_api_base = "https://api.binance.com"
+        if market_type == "Spot":
+            spot_endpoint_label = st.selectbox(
+                "Spot API endpoint",
+                options=list(spot_endpoints.keys()),
+                index=0,
+            )
+            spot_api_base = spot_endpoints[spot_endpoint_label]
         interval = st.selectbox("Interval", options=list(INTERVAL_MS.keys()), index=0)
         start_date = st.date_input("Start date (UTC)", value=default_start)
         end_date = st.date_input("End date (UTC)", value=default_end)
@@ -611,7 +650,7 @@ def main() -> None:
         else:
             start_dt = dt.datetime.combine(start_date, dt.time.min, tzinfo=dt.timezone.utc)
             end_dt = dt.datetime.combine(end_date, dt.time.max, tzinfo=dt.timezone.utc)
-            api_base = "https://api.binance.com" if market_type == "Spot" else "https://fapi.binance.com"
+            api_base = spot_api_base if market_type == "Spot" else "https://fapi.binance.com"
             try:
                 price_df = fetch_klines(
                     symbol=symbol.strip().upper(),
@@ -621,6 +660,27 @@ def main() -> None:
                     api_base=api_base,
                 )
                 st.session_state["price_df"] = price_df
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if market_type == "Spot" and status_code == 451:
+                    alt_base = "https://data-api.binance.vision"
+                    if api_base != alt_base:
+                        st.warning("Binance API returned 451; retrying with Binance Vision endpoint.")
+                        try:
+                            price_df = fetch_klines(
+                                symbol=symbol.strip().upper(),
+                                interval=interval,
+                                start_ms=int(start_dt.timestamp() * 1000),
+                                end_ms=int(end_dt.timestamp() * 1000),
+                                api_base=alt_base,
+                            )
+                            st.session_state["price_df"] = price_df
+                        except requests.RequestException as retry_exc:
+                            st.error(f"Failed to fetch data: {retry_exc}")
+                    else:
+                        st.error(f"Failed to fetch data: {exc}")
+                else:
+                    st.error(f"Failed to fetch data: {exc}")
             except requests.RequestException as exc:
                 st.error(f"Failed to fetch data: {exc}")
 
